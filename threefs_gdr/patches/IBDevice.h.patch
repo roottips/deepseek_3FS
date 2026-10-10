@@ -1,0 +1,37 @@
+/**
+ * =========================================================================
+ * Patch:  src/common/net/ib/IBDevice.h
+ * Purpose: Expose IBDevice::pd() so the GDR subsystem (GpuMemMgr.cc and
+ *          RDMABuf.cc) can use the existing protection domain for
+ *          ibv_reg_dmabuf_mr without re-querying the verbs context.
+ *          Also add an optional BAR1 capacity field used by the cache.
+ * =========================================================================
+
+Context
+-------
+3FS's IBDevice is the per-HCA abstraction: it owns ibv_context, ibv_pd
+and provides regMemory(). GpuMemMgr::cacheFor(IBDevice*) needs the PD
+to construct dma-buf MRs via ibv_reg_dmabuf_mr(); without a public pd()
+accessor we'd duplicate context-discovery logic.
+
+Also exposes the BAR1 size hint (default 8 GiB) so the GpuMrCache default
+matches the device's BAR1 capacity (programmable via the new environment
+variable HF3FS_GDR_BAR1_BUDGET_BYTES).
+*/
+
+--- a/src/common/net/ib/IBDevice.h
++++ b/src/common/net/ib/IBDevice.h
+@@ -56,11 +56,15 @@ class IBDevice {
+   // Existing API.
+   ibv_mr *regMemory(void *addr, size_t length, int access = kAccessFlags);
+   ibv_pd *pd() { return pd_; }              // NEW: expose the PD
++  // NEW: BAR1 budget for the GPU MR cache (env-overridable). Default 8 GiB.
++  size_t bar1Budget() const;
++  // NEW: name (e.g. "mlx5_0") for diagnostic / GpuMemMgr lookup.
++  std::string name() const { return device_name_; }
+   // existing members unchanged
+   std::string device_name_;
+   ibv_context *ctx_{nullptr};
+   ibv_pd *pd_{nullptr};
++  size_t bar1_budget_{0};
+ };

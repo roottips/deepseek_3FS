@@ -1,0 +1,218 @@
+/**
+ * =========================================================================
+ * Patch:  src/lib/common/Shm.cc  (and a small header tweak to Shm.h)
+ * Purpose: Add a GPU-memory allocation mode to ShmBuf so the USRBIO iov
+ *          ring can be backed by GPU device memory instead of POSIX
+ *          shared memory. With this patch, storage servers' RDMA-WRITE
+ *          operations land directly in GPU memory, eliminating the
+ *          cudaMemcpy() step that user applications previously had to do.
+ *
+ * Allocation backend: CUDA Virtual Memory Management (VMM) API
+ *   cuMemAddressReserve -> cuMemCreate -> cuMemMap -> cuMemSetAccess.
+ *   We do NOT use cudaMalloc / cuMemAlloc because:
+ *     * VMM is the only allocation path that reliably supports
+ *       cuMemGetHandleForAddressRange() (dma-buf fd export for RDMA).
+ *     * VMM gives explicit 2 MiB alignment, matching the GPU BAR1 page
+ *       granularity and maximizing mapping efficiency.
+ *     * VMM allocations can be exported as POSIX fd IPC handles so the
+ *       FUSE process and a different user application process can share
+ *       the same physical allocation.
+ * =========================================================================
+
+Context
+-------
+USRBIO is 3FS's zero-copy I/O ring: the user application, the FUSE
+process, and the storage service all share the same iov buffer. Today
+that buffer is allocated via:
+
+    ShmBuf::mapBuf():
+        fd = shm_open(path, O_RDWR | O_CREAT | O_EXCL, 0666);
+        bufStart = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+The data path is:
+
+    SSD -> [storage server RDMA-WRITE] -> Iov shared memory (host)
+                                                 |
+                                       user app cudaMemcpy() -> GPU
+
+With GDR we want:
+
+    SSD -> [storage server RDMA-WRITE] -> Iov GPU memory  (no copy)
+
+This requires:
+  1. Allocate the iov buffer with the CUDA VMM API (cuMemCreate/cuMemMap)
+     via GpuMemMgr::vmmAlloc(), instead of mmap+shm_open.
+  2. Register it via GpuMemMgr so storage servers can target it via
+     RDMA-WRITE (RDMABuf::Inner::registerMemory() already handles the
+     GPU path after the RDMABuf.cc patch).
+  3. Hand the user application a way to obtain the device pointer (the
+     USRBIO API must expose the cuda pointer rather than the mmap ptr).
+
+Why this is safe to ship as a config toggle:
+  - Existing deployments that do NOT set HF3FS_IOV_USE_GPU_MEMORY=1
+    retain the host-memory path verbatim.
+  - When the toggle is on, ShmBuf is local to one process (the FUSE
+    daemon) + one user application; the shm_open path is replaced by a
+    VMM allocation which still permits cross-process GPU sharing via the
+    exported POSIX fd IPC handle (cuMemExportToShareableHandle). For
+    the common case (FUSE and the consuming CUDA app on the same GPU)
+    the VMM-mapped device pointer is directly usable in-process.
+*/
+
+--- a/src/lib/common/Shm.cc
++++ b/src/lib/common/Shm.cc
+@@ -23,6 +23,10 @@
+ #include "StorageClient.h"
++#include "common/net/ib/GpuMemMgr.h"
++#include <cstdlib>
++
++// New config flag; see hf3fs/docs/USRBIO.md.
++static bool s_use_gpu_memory = [] {
++  const char *e = std::getenv("HF3FS_IOV_USE_GPU_MEMORY");
++  return e != nullptr && std::string(e) == "1";
++}();
++static size_t s_gpu_device_id = [] {
++  const char *e = std::getenv("HF3FS_IOV_GPU_DEVICE_ID");
++  return e ? std::stoul(e) : 0;
++}();
+
+ void ShmBuf::mapBuf() {
+   if (s_use_gpu_memory) {
+-    return mapBufGpu_();          // NEW path
++    return mapBufGpu_();
+   }
+   // Existing path unchanged:
+   auto fd = shm_open(path_.c_str(),
+                      O_RDWR | (owner_ ? O_CREAT | O_EXCL : 0), 0666);
+@@ -54,6 +58,72 @@ void ShmBuf::mapBuf() {
+   ...
+ }
+
++// ---- NEW: GPU-backed mapBuf (CUDA VMM API) ---------------------------
++//
++// Allocates the whole iov ring as a single VMM region on the target GPU:
++//   cuMemAddressReserve -> cuMemCreate -> cuMemMap -> cuMemSetAccess
++// via GpuMemMgr::vmmAlloc(). The returned GpuVmmAllocation is RAII:
++// dropping the shared_ptr reverses the mapping (cuMemUnmap /
++// cuMemRelease / cuMemAddressFree), so unmapBufGpu_() just releases it.
++
++void ShmBuf::mapBufGpu_() {
++  // 1. Probe CUDA driver; fail loudly if the user asked for GPU-backed
++  //    iov but CUDA is unavailable (rather than silently degrading and
++  //    landing host memory which the caller's CUDA kernels cannot read).
++  if (!GpuMemMgr::probe()) {
++    throw std::runtime_error(
++        "HF3FS_IOV_USE_GPU_MEMORY=1 but CUDA is unavailable");
++  }
++
++  // 2. Allocate a single contiguous device buffer for the whole ring
++  //    using the VMM API. vmmAlloc() rounds size up to 2 MiB
++  //    (kGpuVmmGranularity), sets SYNC_MEMOPS, and -- because we pass
++  //    export_ipc=true -- also exports a POSIX fd IPC handle so a
++  //    different process (the user application) can map the same
++  //    physical allocation via cuMemImportFromShareableHandle.
++  //    We do NOT call cudaMalloc/cuMemAlloc here: VMM is the only
++  //    allocation kind that reliably supports dma-buf fd export for the
++  //    RDMA registration path used by GpuMrCache.
++  vmm_alloc_ = GpuMemMgr::vmmAlloc(
++      total_size_, static_cast<int>(s_gpu_device_id),
++      /*export_ipc=*/true);
++  if (!vmm_alloc_ || !vmm_alloc_->valid()) {
++    throw std::runtime_error(
++        "GpuMemMgr::vmmAlloc failed for USRBIO iov ring "
++        "(cuMemAddressReserve/cuMemCreate/cuMemMap)");
++  }
++
++  // 3. Advertise the device VA to the rest of ShmBuf's existing API.
++  //    bufStart_ is the pointer every I/O path already uses; pointing
++  //    it at the VMM-mapped device VA means no other ShmBuf code has
++  //    to change.
++  bufStart_ = reinterpret_cast<uint8_t *>(vmm_alloc_->va);
++  bufSize_ = total_size_;
++  is_gpu_backed_ = true;
++
++  // 4. Register the GPU buffer with each IB device via GpuMemMgr so
++  //    that RDMABuf::Inner::registerMemory() (already patched) can
++  //    reuse the cached MR. We do the explicit pin here so the cache
++  //    is warm before the first I/O arrives. GpuMrCache picks the
++  //    dma-buf path first (cuMemGetHandleForAddressRange) and falls
++  //    back to nvidia-peermem when dma-buf is unavailable.
++  for (IBDevice *dev : IBManager::instance().devices()) {
++    auto &cache = GpuMemMgr::instance().cacheFor(dev);
++    cache.registerRegion(bufStart_, bufSize_);
++  }
++
++  // 5. The IPC fd exported by vmmAlloc (if export_ipc succeeded) is
++  //    available as vmm_alloc_->ipc_fd. A separate user application
++  //    process can import it via GpuMemMgr::vmmImportFromIpcFd() to
++  //    obtain the same device VA and feed it directly to CUDA kernels,
++  //    bypassing any cudaMemcpy. The fd is published to peers via the
++  //    existing ShmBuf metadata path (path_ is repurposed to carry the
++  //    "/proc/self/fd/<n>" symlink when is_gpu_backed_).
++}
++
++void ShmBuf::unmapBufGpu_() {
++  if (vmm_alloc_ && is_gpu_backed_) {
++    // RAII: dropping the shared_ptr runs GpuVmmAllocation::destroy()
++    // which reverses the VMM mapping in order:
++    //   cuMemUnmap -> cuMemRelease -> cuMemAddressFree
++    // and closes the IPC fd if one was exported. The GpuMrCache entries
++    // registered in step 4 are LRU-evicted on their own; we do not
++    // explicitly deregister them here because the device VA is gone and
++    // any in-flight verbs would be invalid anyway.
++    vmm_alloc_.reset();
++    bufStart_ = nullptr;
++    bufSize_ = 0;
++    is_gpu_backed_ = false;
++  }
++}
+
+--- a/src/lib/common/Shm.h
++++ b/src/lib/common/Shm.h
+@@ -23,6 +23,9 @@
++// Forward decl so Shm.h does not need to include the full GpuMemMgr.h
++// (which pulls in cuda.h + infiniband/verbs.h).
++namespace hf3fs::net::ib { struct GpuVmmAllocation; }
++
+@@ -47,6 +50,12 @@ class ShmBuf {
+  private:
+   void mapBuf();
++  void mapBufGpu_();             // NEW: VMM-backed allocation path
++  void unmapBufGpu_();           // NEW: RAII teardown of the VMM region
+   uint8_t *bufStart_{nullptr};
+   size_t bufSize_{0};
+   bool is_gpu_backed_{false};     // NEW
+   std::string path_;
+   bool owner_{true};
++  // NEW: owns the VMM allocation (cuMemAddressReserve / cuMemCreate /
++  // cuMemMap / cuMemSetAccess). RAII; reset() tears down the mapping.
++  std::shared_ptr<hf3fs::net::ib::GpuVmmAllocation> vmm_alloc_;
+
+ public:
++  // NEW: return the CUDA device pointer for GPU-backed iovs. Returns
++  // nullptr when this ShmBuf is host-backed (caller falls back to
++  // host pointer + cudaMemcpy).
++  void *gpuPtr() const { return is_gpu_backed_ ? bufStart_ : nullptr; }
++  bool isGpuBacked() const { return is_gpu_backed_; }
++  // NEW: POSIX fd IPC handle for cross-process sharing of the VMM
++  // allocation. -1 when not GPU-backed or export failed. The peer
++  // process imports it via GpuMemMgr::vmmImportFromIpcFd().
++  int ipcFd() const {
++    return (is_gpu_backed_ && vmm_alloc_) ? vmm_alloc_->ipc_fd : -1;
++  }
++
+   // Existing API unchanged:
+   void *ptr() const { return bufStart_; }
+
+--- a/src/fuse/IoRing.h   (USRBIO API surface change)
++++ b/src/fuse/IoRing.h
+@@ -88,6 +88,8 @@ struct IoRing {
++  // NEW: when the underlying iov is GPU-backed, this returns the device
++  // pointer that the user application should pass to CUDA kernels
++  // instead of doing cudaMemcpy from the host iov buffer.
++  void *gpuIovBase() const { return iov_->gpuPtr(); }
++  bool iovIsGpuBacked() const { return iov_->isGpuBacked(); }
++  // NEW: POSIX fd the user application imports via
++  // GpuMemMgr::vmmImportFromIpcFd() when it runs in a different
++  // process than the FUSE daemon.
++  int iovIpcFd() const { return iov_->ipcFd(); }
