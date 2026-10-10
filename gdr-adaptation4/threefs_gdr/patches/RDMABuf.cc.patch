@@ -1,0 +1,110 @@
+/**
+ * =========================================================================
+ * Patch:  src/common/net/ib/RDMABuf.cc
+ * Purpose: Implement GPU-aware memory registration for RDMABuf::Inner.
+ *
+ * Baseline: 3FS commit f84e609692dded708f9c910caf5c5af3444e1024
+ *
+ * Context
+ * -------
+ * Baseline registerMemory() (line 107-127):
+ *   int RDMABuf::Inner::registerMemory() {
+ *     for (auto &dev : IBDevice::all()) {
+ *       auto mr = dev->regMemory(ptr_, capacity_, kAccessFlags);
+ *       if (!mr) return -1;
+ *       mrs_[dev->id()] = mr;
+ *     }
+ *     return 0;
+ *   }
+ *
+ * Baseline ~Inner() (line 50-63):
+ *   for (auto &dev : IBDevice::all()) {
+ *     auto mr = mrs_.at(dev->id());
+ *     if (mr) dev->deregMemory(mr);
+ *   }
+ *
+ * This patch modifies registerMemory() to:
+ *   1. Detect if ptr_ is a GPU device pointer.
+ *   2. If so, for each IBDevice, route through GpuMemMgr's LRU cache
+ *      (which sets SYNC_MEMOPS, picks peermem/dmabuf, caches the MR).
+ *   3. Store the GpuMrHandle in gpu_handles_[] and adopt its ->mr into
+ *      mrs_[] so getMR()/getRkeys() work unchanged.
+ *
+ * ~Inner() is modified to release cache refs for GPU-backed buffers
+ * instead of calling dev->deregMemory() (which would double-free the
+ * cache's MR).
+ * =========================================================================
+ */
+
+--- a/src/common/net/ib/RDMABuf.cc
++++ b/src/common/net/ib/RDMABuf.cc
+@@ -12,6 +12,7 @@
+ #include "common/monitor/Recorder.h"
+ #include "common/net/ib/IBDevice.h"
++#include "common/net/ib/GpuMemMgr.h"
+ #include "memory/common/GlobalMemoryAllocator.h"
+
+ namespace hf3fs::net {
+@@ -50,6 +51,14 @@ RDMABuf::Inner::~Inner() {
+   XLOGF(DBG, "RDMABuf free and deregister, ptr {}", (void *)ptr_);
+   for (auto &dev : IBDevice::all()) {
+     XLOGF_IF(FATAL, UNLIKELY(dev->id() >= IBDevice::kMaxDeviceCnt), "{} > {}", dev->id(), IBDevice::kMaxDeviceCnt);
+-    auto mr = mrs_.at(dev->id());
+-    if (mr) {
++    auto devId = dev->id();
++    // GDR: if this buffer was registered via the GpuMrCache, release
++    // the cache ref (shared_ptr) instead of deregistering the MR --
++    // the cache owns the MR lifetime and may reuse it.
++    if (gpu_backed_ && gpu_handles_.at(devId)) {
++      GpuMemMgr::instance().cacheFor(dev.get()).release(gpu_handles_.at(devId));
++      gpu_handles_.at(devId).reset();
++      mrs_.at(devId) = nullptr;  // MR is owned by the cache now
++      continue;
++    }
++    auto mr = mrs_.at(devId);
++    if (mr) {
+       dev->deregMemory(mr);
+     }
+   }
+@@ -107,6 +116,36 @@ int RDMABuf::Inner::registerMemory() {
++  // GDR: detect GPU device pointer and route to GpuMemMgr's LRU cache.
++  if (detectGpuPointer_()) {
++    gpu_backed_ = true;
++    for (auto &dev : IBDevice::all()) {
++      XLOGF_IF(FATAL,
++               UNLIKELY(dev->id() >= IBDevice::kMaxDeviceCnt),
++               "{} >= {}", dev->id(), IBDevice::kMaxDeviceCnt);
++      auto &cache = GpuMemMgr::instance().cacheFor(dev.get());
++      auto handle = cache.registerRegion(ptr_, capacity_);
++      if (!handle) {
++        XLOGF(ERR, "GDR registerRegion failed for dev {}, ptr {}, len {}",
++              dev->name(), (void *)ptr_, capacity_);
++        return -1;
++      }
++      // Adopt the cache's ibv_mr* into mrs_[] so getMR()/getRkeys()
++      // work unchanged. The cache owns the MR lifetime.
++      gpu_handles_[dev->id()] = handle;
++      mrs_[dev->id()] = handle->mr;
++    }
++    XLOGF(DBG, "RDMABuf GDR-registered, ptr {}, capacity {}",
++          (void *)ptr_, capacity_);
++    return 0;
++  }
++
+   size_t devs = 0;
+   for (auto &dev : IBDevice::all()) {
+     XLOGF_IF(FATAL,
+@@ -129,6 +168,16 @@ int RDMABuf::Inner::init() {
+   return 0;
+ }
+
++bool RDMABuf::Inner::detectGpuPointer_() {
++  // Lazy-init GDR subsystem; if CUDA is unavailable, isDevicePointer
++  // returns false and we fall back to the host-memory path.
++  if (!GpuMemMgr::probe()) {
++    return false;
++  }
++  return GpuMemMgr::isDevicePointer(ptr_);
++}
++
+ /** RDMABufPool */

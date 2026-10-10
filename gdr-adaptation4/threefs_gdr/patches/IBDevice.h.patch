@@ -1,0 +1,43 @@
+/**
+ * =========================================================================
+ * Patch:  src/common/net/ib/IBDevice.h
+ * Purpose: Add a BAR1 capacity hint to IBDevice so the GpuMrCache can
+ *          size its pin budget to the GPU's BAR1 window instead of using
+ *          a hard-coded default.
+ *
+ * Baseline: 3FS commit f84e609692dded708f9c910caf5c5af3444e1024
+ *
+ * Context
+ * -------
+ * In the baseline IBDevice:
+ *   * pd()          -> already public (line 132: ibv_pd *pd() const)
+ *   * name()        -> already public (line 129: const std::string &name())
+ *   * regMemory()   -> already public (line 136)
+ *   * deregMemory() -> already public (line 137)
+ *   * IBDevice::all() -> static, returns const std::vector<IBDevice::Ptr>&
+ *
+ * So unlike the previous (assumed) version of this patch, we do NOT need
+ * to expose pd()/name() -- they are already public. We only add:
+ *   * bar1Budget()  -- returns the BAR1 pin budget for the GpuMrCache
+ *   * bar1_budget_   -- the backing field (env-overridable, default 8 GiB)
+ * =========================================================================
+ */
+
+--- a/src/common/net/ib/IBDevice.h
++++ b/src/common/net/ib/IBDevice.h
+@@ -134,6 +134,11 @@ class IBDevice : public std::enable_shared_from_this<IBDevice> {
+   ibv_mr *regMemory(void *addr, size_t length, int access) const;
+   int deregMemory(ibv_mr *mr) const;
+
++  // GDR: BAR1 budget for the GPU MR cache (env-overridable).
++  // Default 8 GiB; set HF3FS_GDR_BAR1_BUDGET_BYTES to override.
++  size_t bar1Budget() const { return bar1_budget_; }
++
+  private:
+   friend class IBManager;
+   class BackgroundRunner;
+@@ -164,6 +169,7 @@ class IBDevice : public std::enable_shared_from_this<IBDevice> {
+   ibv_device_attr attr_;
+   std::map<uint8_t, Port> ports_;
++  size_t bar1_budget_{8ULL * (1ULL << 30)};  // GDR: 8 GiB default
+ };
