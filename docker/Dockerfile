@@ -4,6 +4,7 @@ ARG RUNTIME_BASE_IMAGE=hf3fs-runtime-base:ubuntu20.04
 ARG HF3FS_RUNTIME_IMAGE=hf3fs:local-seastore
 ARG HF3FS_PROVIDER_IMAGE=hf3fs-build-base:ubuntu20.04
 ARG SGLANG_BASE_IMAGE=lmsysorg/sglang:v0.5.13-xeon
+ARG CUDA_PKG=12-4
 
 # Reusable, slow-moving compiler image.  SeaStore is the superset dependency
 # set, so the same image can build seastore, chunk and bluestore variants.
@@ -93,6 +94,7 @@ RUN test -f "/src/third_party/fio-fio-${FIO_VERSION}.tar.gz" \
 # Runtime base intentionally contains no compiler, headers, cmake, rust or git.
 # Keep it separately taggable so all engine images share these layers.
 FROM ubuntu:${UBUNTU_VERSION} AS runtime-base
+ARG CUDA_PKG
 ENV DEBIAN_FRONTEND=noninteractive
 RUN sed -i 's|http://security.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
       /etc/apt/sources.list \
@@ -107,6 +109,23 @@ RUN sed -i 's|http://security.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu
       libnl-route-3-200 libnuma1 librdmacm1 libsnappy1v5 libssl1.1 libunwind8 \
       libyaml-cpp0.6 libzstd1 zlib1g iproute2 \
  && rm -rf /var/lib/apt/lists/*
+# Install CUDA runtime libraries for the 3FS USRBIO engine's GPUDirect Storage
+# support (direct GPU-memory I/O via cudaHostAlloc / cudaIpcGetMemHandle).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gnupg wget \
+ && install -d -m 0755 /usr/share/keyrings \
+ && wget -qO - https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-ubuntu2004.key \
+    | gpg --dearmor -o /usr/share/keyrings/nvidia-cuda.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/nvidia-cuda.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64 /" \
+    > /etc/apt/sources.list.d/cuda.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends cuda-libraries-${CUDA_PKG} \
+ && rm -rf /var/lib/apt/lists/* \
+ && ldconfig
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:${PATH}
 RUN install -d /opt/3fs/bin /opt/3fs/etc /var/log/3fs /storage /mnt/3fs
 
 FROM ${RUNTIME_BASE_IMAGE} AS runtime
@@ -190,6 +209,7 @@ RUN set -eux; \
 
 FROM ${SGLANG_BASE_IMAGE} AS runtime-sglang
 ARG ENGINE=seastore
+ARG CUDA_PKG
 LABEL org.opencontainers.image.title="3FS FUSE + SGLang" \
       org.opencontainers.image.description="SGLang runtime with the 3FS FUSE client and USRBIO engine" \
       io.deepseek.3fs.storage-engine="${ENGINE}"
@@ -207,6 +227,28 @@ COPY --from=sglang-hf3fs-source /usr/local/bin/3fs-entrypoint /usr/local/bin/3fs
 COPY --from=sglang-hf3fs-source /usr/sbin/ibdev2netdev /usr/sbin/ibdev2netdev
 COPY --from=sglang-hf3fs-source /usr/sbin/ip /usr/sbin/ip
 COPY --from=sglang-hf3fs-source /usr/bin/rdma /usr/bin/rdma
+# Install CUDA runtime libraries for SGLang GPU inference and 3FS USRBIO
+# GPUDirect Storage. SGLang base is Ubuntu 24.04, unlike the 3FS runtime which
+# is Ubuntu 20.04, so CUDA is installed here independently.
+ENV DEBIAN_FRONTEND=noninteractive
+RUN set -eux; \
+    . /etc/os-release; \
+    CUDA_REPO="ubuntu${VERSION_ID//./}"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends gnupg wget; \
+    install -d -m 0755 /usr/share/keyrings; \
+    wget -qO - "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO}/x86_64/cuda-${CUDA_REPO}.key" \
+      | gpg --dearmor -o /usr/share/keyrings/nvidia-cuda.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/nvidia-cuda.gpg] https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPO}/x86_64 /" \
+      > /etc/apt/sources.list.d/cuda.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends cuda-libraries-${CUDA_PKG}; \
+    rm -rf /var/lib/apt/lists/*; \
+    ldconfig
+ENV NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    CUDA_HOME=/usr/local/cuda \
+    PATH=/usr/local/cuda/bin:${PATH}
 COPY docker/sglang-fuse-entrypoint.sh /usr/local/bin/3fs-sglang-entrypoint
 COPY docker/sglang-compat-exec.sh /usr/local/bin/3fs-sglang-compat-exec
 RUN install -d /opt/3fs/libexec \
@@ -218,4 +260,5 @@ RUN install -d /opt/3fs/libexec \
       /usr/local/bin/fusermount3 /usr/sbin/ibdev2netdev /usr/sbin/ip /usr/bin/rdma \
  && install -d /var/log/3fs /mnt/3fs \
  && printf '%s\n' user_allow_other >/etc/fuse.conf \
+ && ldconfig \
  && /opt/3fs/bin/fio-3.16 --version
