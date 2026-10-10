@@ -20,6 +20,7 @@
 #include <folly/logging/xlog.h>
 #include <gtest/gtest_prod.h>
 #include <infiniband/verbs.h>
+#include <memory>  // for std::shared_ptr (GpuMrHandle forward-declared)
 #include <map>
 #include <memory>
 #include <mutex>
@@ -36,6 +37,11 @@
 namespace hf3fs::net {
 
 using RDMABufMR = ibv_mr *;
+
+// GDR: forward-declare GPU MR handle from GpuMemMgr.h (avoid pulling
+// cuda.h into every translation unit that includes RDMABuf.h).
+struct GpuMrHandle;
+using GpuMrHandlePtr = std::shared_ptr<GpuMrHandle>;
 
 class RDMARemoteBuf {
   struct Rkey {
@@ -275,6 +281,8 @@ class RDMABuf {
     int allocateMemory();
     int registerMemory();
 
+    bool detectGpuPointer_();
+
     RDMABufMR getMR(int dev) const;
     bool getRkeys(std::array<RDMARemoteBuf::Rkey, IBDevice::kMaxDeviceCnt> &rkeys) const;
 
@@ -288,6 +296,12 @@ class RDMABuf {
     size_t capacity_;
     std::array<RDMABufMR, IBDevice::kMaxDeviceCnt> mrs_;
     bool userBuffer_;
+    // GDR: per-device cached GPU MR handle. When non-null, the
+    // corresponding mrs_[devId] is adopted from the GpuMrCache and
+    // must NOT be deregistered via dev->deregMemory(); instead we
+    // release the shared_ptr which decrements the cache refcount.
+    std::array<GpuMrHandlePtr, IBDevice::kMaxDeviceCnt> gpu_handles_;
+    bool gpu_backed_{false};
   };
 
   static RDMABuf allocate(size_t size, std::weak_ptr<RDMABufPool> pool);

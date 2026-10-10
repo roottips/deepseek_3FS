@@ -136,6 +136,9 @@ class IBDevice : public std::enable_shared_from_this<IBDevice> {
   ibv_mr *regMemory(void *addr, size_t length, int access) const;
   int deregMemory(ibv_mr *mr) const;
 
+  // GDR: BAR1 budget for the GPU MR cache (env-overridable).
+  // Default 8 GiB; set HF3FS_GDR_BAR1_BUDGET_BYTES to override.
+  size_t bar1Budget() const { return bar1_budget_; }
  private:
   friend class IBManager;
   class BackgroundRunner;
@@ -167,6 +170,7 @@ class IBDevice : public std::enable_shared_from_this<IBDevice> {
   std::unique_ptr<ibv_pd, Deleter> pd_;
   ibv_device_attr attr_;
   std::map<uint8_t, Port> ports_;
+  size_t bar1_budget_{8ULL * (1ULL << 30)};  // GDR: 8 GiB default
 };
 
 class IBPort {

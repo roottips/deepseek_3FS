@@ -11,6 +11,7 @@
 
 #include "common/monitor/Recorder.h"
 #include "common/net/ib/IBDevice.h"
+#include "common/net/ib/GpuMemMgr.h"
 #include "memory/common/GlobalMemoryAllocator.h"
 
 namespace hf3fs::net {
