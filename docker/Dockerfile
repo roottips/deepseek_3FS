@@ -1,0 +1,221 @@
+ARG UBUNTU_VERSION=20.04
+ARG BUILD_BASE_IMAGE=hf3fs-build-base:ubuntu20.04
+ARG RUNTIME_BASE_IMAGE=hf3fs-runtime-base:ubuntu20.04
+ARG HF3FS_RUNTIME_IMAGE=hf3fs:local-seastore
+ARG HF3FS_PROVIDER_IMAGE=hf3fs-build-base:ubuntu20.04
+ARG SGLANG_BASE_IMAGE=lmsysorg/sglang:v0.5.13-xeon
+
+# Reusable, slow-moving compiler image.  SeaStore is the superset dependency
+# set, so the same image can build seastore, chunk and bluestore variants.
+FROM ubuntu:${UBUNTU_VERSION} AS build-base
+ARG RUSTUP_DIST_SERVER
+ARG RUSTUP_UPDATE_ROOT
+ARG SKIP_LLVM=0
+ARG APT_PROXY
+ARG APT_MIRROR
+ARG DOWNLOAD_PROXY
+COPY scripts/install-seastore-build-deps-ubuntu20.04.sh /tmp/install-build-deps.sh
+RUN --mount=type=bind,source=third_party,target=/third_party,readonly \
+    RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER}" \
+    RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT}" \
+    SKIP_LLVM="${SKIP_LLVM}" \
+    APT_PROXY="${APT_PROXY}" \
+    APT_MIRROR="${APT_MIRROR}" \
+    DOWNLOAD_PROXY="${DOWNLOAD_PROXY}" \
+    DOWNLOAD_CACHE_DIR=/third_party \
+    /tmp/install-build-deps.sh && rm -f /tmp/install-build-deps.sh
+ENV RUSTUP_HOME=/opt/rustup \
+    CARGO_HOME=/opt/cargo \
+    RUSTUP_TOOLCHAIN=1.86.0 \
+    PATH=/opt/cargo/bin:/opt/rust/bin:${PATH}
+# Seastar's dependency probe requires these development packages in addition
+# to the common Ceph/3FS toolchain installed by build-base.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libc-ares-dev libclang-dev libcrypto++-dev libgnutls28-dev libsctp-dev \
+      python3-pyelftools systemtap-sdt-dev valgrind xfslibs-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+
+FROM ${BUILD_BASE_IMAGE} AS builder
+ARG ENGINE=chunk
+ARG BUILD_TYPE=Release
+ARG JOBS=4
+ARG SEASTORE_IO_URING=ON
+COPY . .
+RUN test "${ENGINE}" = chunk -o "${ENGINE}" = seastore -o "${ENGINE}" = bluestore
+# docker/Makefile applies the repository's dependency patches before sending
+# the context. The image consumes those patched sources without requiring Git.
+RUN --mount=type=cache,id=hf3fs-seastore-build,target=/src/build-seastore \
+    --mount=type=cache,id=hf3fs-cargo-registry,target=/opt/cargo/registry \
+    --mount=type=cache,id=hf3fs-cargo-target,target=/src/target \
+    make config ENGINE="${ENGINE}" BUILD_DIR="build-${ENGINE}" BUILD_TYPE="${BUILD_TYPE}" \
+      SEASTORE_IO_URING="${SEASTORE_IO_URING}" \
+      IPO=OFF ENABLE_FORMAT_TARGETS=OFF CMAKE_CXX_FLAGS=-include\ cstdint\ -Wno-error=maybe-uninitialized \
+ && rm -f build-${ENGINE}/Hf3fsJemalloc_project-prefix/src/Hf3fsJemalloc_project-stamp/Hf3fsJemalloc_project-configure \
+      build-${ENGINE}/Hf3fsJemalloc_project-prefix/src/Hf3fsJemalloc_project-stamp/Hf3fsJemalloc_project-build \
+      build-${ENGINE}/Hf3fsJemalloc_project-prefix/src/Hf3fsJemalloc_project-stamp/Hf3fsJemalloc_project-install \
+      build-${ENGINE}/Hf3fsJemalloc_project-prefix/src/Hf3fsJemalloc_project-stamp/Hf3fsJemalloc_project-done \
+ && make build ENGINE="${ENGINE}" BUILD_DIR="build-${ENGINE}" JOBS="${JOBS}"
+# SeaStore is compiled by GCC 13, while focal ships GCC 10's libstdc++.
+RUN --mount=type=cache,id=hf3fs-seastore-build,target=/src/build-seastore \
+    install -d /out/bin \
+ && for name in admin_cli hf3fs-admin hf3fs_fuse_main meta_main mgmtd_main \
+      monitor_collector_main storage_main; do \
+      install -m 0755 "build-${ENGINE}/bin/${name}" /out/bin/; \
+    done \
+ && find /out/bin -type f -exec strip --strip-unneeded '{}' ';' \
+ && install -d /out/lib \
+ && find /usr/local/lib -name 'libfuse3.so*' -exec cp -a '{}' /out/lib/ ';' \
+ && cp -L build-${ENGINE}/src/lib/api/libhf3fs_api_shared.so /out/lib/libhf3fs_api_shared.so \
+ && cp -L "$(g++-13 -print-file-name=libstdc++.so.6)" /out/lib/libstdc++.so.6 \
+ && cp -L "$(gcc-13 -print-file-name=libgcc_s.so.1)" /out/lib/libgcc_s.so.1
+
+# Build fio and its external 3FS USRBIO engine together.  External fio engines
+# are ABI-coupled to fio's headers, so the executable and plugin must use the
+# same fio release and config-host.h.
+FROM builder AS fio-usrbio-builder
+ARG FIO_VERSION=3.16
+RUN test -f "/src/third_party/fio-fio-${FIO_VERSION}.tar.gz" \
+ && tar -xzf "/src/third_party/fio-fio-${FIO_VERSION}.tar.gz" -C /tmp \
+ && cd "/tmp/fio-fio-${FIO_VERSION}" \
+ && ./configure \
+ && make -j"$(nproc)" fio \
+ && make -B -C /src/benchmarks/fio_usrbio \
+      HF3FS_LIB_DIR=/out/lib \
+      HF3FS_INCLUDE_DIR=/src/src/lib/api \
+      FIO_SRC_DIR="/tmp/fio-fio-${FIO_VERSION}" \
+ && install -Dm0755 "/tmp/fio-fio-${FIO_VERSION}/fio" /out/usrbio/fio-3.16 \
+ && install -Dm0755 /src/benchmarks/fio_usrbio/hf3fs_usrbio.so /out/usrbio/hf3fs_usrbio.so \
+ && install -Dm0755 /out/lib/libhf3fs_api_shared.so \
+      /out/usrbio/libhf3fs_api_shared.so
+
+# Runtime base intentionally contains no compiler, headers, cmake, rust or git.
+# Keep it separately taggable so all engine images share these layers.
+FROM ubuntu:${UBUNTU_VERSION} AS runtime-base
+ENV DEBIAN_FRONTEND=noninteractive
+RUN sed -i 's|http://security.ubuntu.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
+      /etc/apt/sources.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates libaio1 libatomic1 libboost-atomic1.71.0 libboost-context1.71.0 \
+      libboost-filesystem1.71.0 libboost-program-options1.71.0 \
+      libboost-regex1.71.0 libboost-system1.71.0 libboost-thread1.71.0 \
+      libdouble-conversion3 libdwarf1 libevent-2.1-7 libfuse3-3 \
+      libgflags2.2 libgoogle-glog0v5 libgoogle-perftools4 libhwloc15 \
+      libibverbs1 libicu66 libjemalloc2 liblz4-1 liblzma5 libnl-3-200 \
+      libnl-route-3-200 libnuma1 librdmacm1 libsnappy1v5 libssl1.1 libunwind8 \
+      libyaml-cpp0.6 libzstd1 zlib1g iproute2 \
+ && rm -rf /var/lib/apt/lists/*
+RUN install -d /opt/3fs/bin /opt/3fs/etc /var/log/3fs /storage /mnt/3fs
+
+FROM ${RUNTIME_BASE_IMAGE} AS runtime
+ARG ENGINE=chunk
+LABEL org.opencontainers.image.title="3FS" \
+      org.opencontainers.image.description="3FS multi-role runtime image" \
+      io.deepseek.3fs.storage-engine="${ENGINE}"
+ENV HF3FS_ENGINE=${ENGINE}
+COPY --from=builder /out/bin/ /opt/3fs/bin/
+# The build dependency installer pins FDB 7.3.63. Copy its single runtime
+# library from the builder instead of carrying apt/curl or downloading it twice.
+COPY --from=builder /usr/lib/libfdb_c.so /usr/lib/libfdb_c.so
+COPY --from=builder /out/lib/ /usr/local/lib/
+COPY --from=builder /usr/local/lib/liburing.so* /usr/local/lib/
+COPY --from=fio-usrbio-builder /out/usrbio/fio-3.16 /opt/3fs/bin/fio-3.16
+COPY --from=fio-usrbio-builder /out/usrbio/hf3fs_usrbio.so /opt/3fs/lib/hf3fs_usrbio.so
+COPY --from=fio-usrbio-builder /out/usrbio/libhf3fs_api_shared.so /opt/3fs/lib/libhf3fs_api_shared.so
+# libfuse invokes this helper when mounting.  The runtime library package alone
+# does not provide it, while our pinned libfuse build installs it here.
+COPY --from=builder /usr/local/bin/fusermount3 /usr/local/bin/fusermount3
+# libibverbs1 alone cannot enumerate mlx5 devices. Reuse the provider already
+# installed in the builder instead of downloading packages in the runtime stage.
+COPY --from=builder /etc/libibverbs.d/ /etc/libibverbs.d/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libibverbs/ /usr/lib/x86_64-linux-gnu/libibverbs/
+COPY --from=builder /usr/lib/x86_64-linux-gnu/libmlx5.so* /usr/lib/x86_64-linux-gnu/
+COPY configs/ /opt/3fs/etc/
+COPY docker/entrypoint.sh /usr/local/bin/3fs-entrypoint
+COPY docker/ibdev2netdev /usr/sbin/ibdev2netdev
+RUN chmod 0755 /usr/local/bin/3fs-entrypoint /usr/sbin/ibdev2netdev \
+ && find /etc/libibverbs.d -type f ! -name mlx5.driver -delete \
+ && printf '%s\n' user_allow_other >/etc/fuse.conf \
+ && printf '%s\n' "${ENGINE}" >/opt/3fs/ENGINE \
+ && ldconfig
+WORKDIR /opt/3fs
+ENTRYPOINT ["/usr/local/bin/3fs-entrypoint"]
+CMD ["help"]
+
+# Fast overlay for an already-built 3FS image. This is useful when only the
+# mlx5 userspace provider is missing and rebuilding all 3FS binaries is
+# unnecessary. The normal runtime stage above includes the same files.
+FROM ${HF3FS_PROVIDER_IMAGE} AS rdma-provider-source
+FROM ${HF3FS_RUNTIME_IMAGE} AS runtime-rdma-overlay
+COPY --from=fio-usrbio-builder /out/usrbio/fio-3.16 /opt/3fs/bin/fio-3.16
+COPY --from=fio-usrbio-builder /out/usrbio/hf3fs_usrbio.so /opt/3fs/lib/hf3fs_usrbio.so
+COPY --from=fio-usrbio-builder /out/usrbio/libhf3fs_api_shared.so /opt/3fs/lib/libhf3fs_api_shared.so
+COPY --from=rdma-provider-source /usr/local/bin/fusermount3 /usr/local/bin/fusermount3
+COPY --from=rdma-provider-source /etc/libibverbs.d/ /etc/libibverbs.d/
+COPY --from=rdma-provider-source /usr/lib/x86_64-linux-gnu/libibverbs/ /usr/lib/x86_64-linux-gnu/libibverbs/
+COPY --from=rdma-provider-source /usr/lib/x86_64-linux-gnu/libmlx5.so* /usr/lib/x86_64-linux-gnu/
+COPY docker/ibdev2netdev /usr/sbin/ibdev2netdev
+RUN chmod 0755 /usr/sbin/ibdev2netdev /opt/3fs/bin/fio-3.16 \
+ && find /etc/libibverbs.d -type f ! -name mlx5.driver -delete \
+ && printf '%s\n' user_allow_other >/etc/fuse.conf \
+ && printf '%s\n' /opt/3fs/lib >/etc/ld.so.conf.d/hf3fs.conf \
+ && ldconfig
+
+# Export only the 3FS FUSE/USRBIO tools and their non-glibc dependency closure.
+# The source image is Ubuntu 20.04 while SGLang is Ubuntu 24.04, so keeping the
+# legacy libraries private avoids replacing libraries used by Python/SGLang.
+FROM ${HF3FS_RUNTIME_IMAGE} AS sglang-hf3fs-source
+RUN set -eux; \
+    install -d /hf3fs-overlay/compat-lib /hf3fs-overlay/libibverbs; \
+    cp -L /usr/lib/x86_64-linux-gnu/libibverbs/libmlx5-*.so /hf3fs-overlay/libibverbs/; \
+    { \
+      ldd /opt/3fs/bin/hf3fs_fuse_main; \
+      ldd /opt/3fs/bin/fio-3.16; \
+      ldd /opt/3fs/lib/hf3fs_usrbio.so; \
+      ldd /opt/3fs/lib/libhf3fs_api_shared.so; \
+      ldd /usr/local/bin/fusermount3; \
+      ldd /usr/sbin/ip; \
+      ldd /usr/bin/rdma; \
+      for provider in /hf3fs-overlay/libibverbs/*.so; do ldd "${provider}"; done; \
+    } | awk '$2 == "=>" && $3 ~ /^\// { print $3 }' | sort -u | \
+    while read -r library; do \
+      name="$(basename "${library}")"; \
+      case "${name}" in \
+        libc.so.*|libm.so.*|libmvec.so.*|libpthread.so.*|libdl.so.*|librt.so.*|ld-linux-*.so.*) continue ;; \
+      esac; \
+      cp -L "${library}" "/hf3fs-overlay/compat-lib/${name}"; \
+    done
+
+FROM ${SGLANG_BASE_IMAGE} AS runtime-sglang
+ARG ENGINE=seastore
+LABEL org.opencontainers.image.title="3FS FUSE + SGLang" \
+      org.opencontainers.image.description="SGLang runtime with the 3FS FUSE client and USRBIO engine" \
+      io.deepseek.3fs.storage-engine="${ENGINE}"
+ENV HF3FS_ENGINE=${ENGINE}
+COPY --from=sglang-hf3fs-source /opt/3fs/bin/hf3fs_fuse_main /opt/3fs/bin/hf3fs_fuse_main
+COPY --from=sglang-hf3fs-source /opt/3fs/bin/fio-3.16 /opt/3fs/bin/fio-3.16
+COPY --from=sglang-hf3fs-source /opt/3fs/lib/ /opt/3fs/lib/
+COPY --from=sglang-hf3fs-source /opt/3fs/etc/ /opt/3fs/etc/
+COPY --from=sglang-hf3fs-source /opt/3fs/ENGINE /opt/3fs/ENGINE
+COPY --from=sglang-hf3fs-source /hf3fs-overlay/compat-lib/ /opt/3fs/compat-lib/
+COPY --from=sglang-hf3fs-source /hf3fs-overlay/libibverbs/ /usr/lib/x86_64-linux-gnu/libibverbs/
+COPY --from=sglang-hf3fs-source /etc/libibverbs.d/mlx5.driver /etc/libibverbs.d/mlx5.driver
+COPY --from=sglang-hf3fs-source /usr/local/bin/fusermount3 /usr/local/bin/fusermount3
+COPY --from=sglang-hf3fs-source /usr/local/bin/3fs-entrypoint /usr/local/bin/3fs-entrypoint
+COPY --from=sglang-hf3fs-source /usr/sbin/ibdev2netdev /usr/sbin/ibdev2netdev
+COPY --from=sglang-hf3fs-source /usr/sbin/ip /usr/sbin/ip
+COPY --from=sglang-hf3fs-source /usr/bin/rdma /usr/bin/rdma
+COPY docker/sglang-fuse-entrypoint.sh /usr/local/bin/3fs-sglang-entrypoint
+COPY docker/sglang-compat-exec.sh /usr/local/bin/3fs-sglang-compat-exec
+RUN install -d /opt/3fs/libexec \
+ && mv /opt/3fs/bin/hf3fs_fuse_main /opt/3fs/libexec/hf3fs_fuse_main \
+ && mv /opt/3fs/bin/fio-3.16 /opt/3fs/libexec/fio-3.16 \
+ && ln -s /usr/local/bin/3fs-sglang-compat-exec /opt/3fs/bin/hf3fs_fuse_main \
+ && ln -s /usr/local/bin/3fs-sglang-compat-exec /opt/3fs/bin/fio-3.16 \
+ && chmod 0755 /usr/local/bin/3fs-sglang-entrypoint /usr/local/bin/3fs-sglang-compat-exec /usr/local/bin/3fs-entrypoint \
+      /usr/local/bin/fusermount3 /usr/sbin/ibdev2netdev /usr/sbin/ip /usr/bin/rdma \
+ && install -d /var/log/3fs /mnt/3fs \
+ && printf '%s\n' user_allow_other >/etc/fuse.conf \
+ && /opt/3fs/bin/fio-3.16 --version
