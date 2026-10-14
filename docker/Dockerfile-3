@@ -23,7 +23,7 @@ ARG APT_PROXY
 ARG APT_MIRROR
 ARG DOWNLOAD_PROXY
 ARG CUDA_PKG
-ARG ENABLE_CUDA
+ARG ENABLE_CUDAF
 COPY scripts/install-seastore-build-deps-ubuntu20.04.sh /tmp/install-build-deps.sh
 RUN --mount=type=bind,source=third_party,target=/third_party,readonly \
     RUSTUP_DIST_SERVER="${RUSTUP_DIST_SERVER}" \

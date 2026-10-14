@@ -1,0 +1,64 @@
+"""
+=========================================================================
+ Patch: python/sglang/srt/disaggregation/utils.py
+ Purpose: Register the "gdr" backend name in the disaggregation engine
+          dispatch table so server_args.disaggregation_transfer_engine =
+          "gdr" routes to GdrKVManager.
+ Apply:   patch -p1 < this_file.patch   (run from the SGLang repo root)
+=========================================================================
+
+Context
+-------
+``utils.py`` owns the registry that maps the user-facing
+``disaggregation_transfer_engine`` string to the (Manager, Sender,
+Receiver, BootstrapServer) tuple. Mooncake and NIXL each have an entry;
+this patch adds GDR alongside them.
+
+The mapping function is ``get_kv_transfer_class(backend: str)``. We extend
+the dispatch table by one row. No new env-var is required; users select
+the backend through ``ServerArgs(disaggregation_transfer_engine="gdr")``.
+"""
+
+--- a/python/sglang/srt/disaggregation/utils.py
++++ b/python/sglang/srt/disaggregation/utils.py
+@@ -12,6 +12,7 @@ from enum import Enum, auto
+ class DisaggregationTransferEngine(str, Enum):
+     MOONCAKE = "mooncake"
+     NIXL = "nixl"
++    GDR = "gdr"
+     # Legacy/aliases kept for backward compatibility.
+     @classmethod
+     def from_str(cls, s: str) -> "DisaggregationTransferEngine":
+@@ -140,6 +141,17 @@ def get_kv_transfer_class(backend: str):
+             return NixlKVManager, NixlKVSender, NixlKVReceiver, NixlKVBootstrapServer
+         except ImportError as exc:
+             raise ImportError(...)
++
++    elif backend == DisaggregationTransferEngine.GDR or backend == "gdr":
++        try:
++            from sglang.srt.disaggregation.gdr.conn import (
++                GdrKVManager, GdrKVSender,
++                GdrKVReceiver, GdrKVBootstrapServer,
++            )
++            return GdrKVManager, GdrKVSender, GdrKVReceiver, GdrKVBootstrapServer
++        except ImportError as exc:
++            raise ImportError(
++                "GDR backend requires `pip install ibverbs` and the "
++                "sglang.srt.disaggregation.gdr module. Original error: "
++                f"{exc}") from exc
+     else:
+         raise ValueError(f"Unknown disaggregation backend: {backend}")
+
+
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -class ServerArgs:
+     # ... existing fields ...
+     disaggregation_transfer_engine: str = "mooncake"
++    # When set to "gdr", SGLang uses native GPU-Direct RDMA for KV-cache
++    # transfer (see sglang/srt/disaggregation/gdr/). Requires:
++    #   * Mellanox ConnectX-6 Dx or later NIC on the same PCIe root complex
++    #   * `modprobe nvidia-peermem` (legacy) or CUDA 13+ dma-buf path
++    #   * `pip install ibverbs`
++    # Tuning via SGLANG_GDR_* environment variables (see parallel_state.py).
++    gdr_worker_threads: int = 4
